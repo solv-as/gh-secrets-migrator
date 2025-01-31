@@ -67,7 +67,8 @@ namespace SecretsMigrator
             _log.LogInformation($"TARGET ORG: {targetOrg}");
             _log.LogInformation($"TARGET REPO: {targetRepo}");
 
-            var branchName = "migrate-secrets";
+            var dateTimePrefix = DateTime.Now.ToString("yyyyMMddHHmm");
+            var branchName = $"{dateTimePrefix}-migrate-secrets";
             var workflow = GenerateWorkflow(targetOrg, targetRepo, branchName);
 
             var githubClient = new GithubClient(_log, sourcePat);
@@ -96,33 +97,30 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Install Crypto Package
-        run: |
-          Install-Package -Name Sodium.Core -ProviderName NuGet -Scope CurrentUser -RequiredVersion 1.3.0 -Destination . -Force
+      - name: Install PSSodium
+        run: Install-Module -Name PSSodium -Repository PSGallery -Force
         shell: pwsh
+        
       - name: Migrate Secrets
         run: |
-          $sodiumPath = Resolve-Path "".\Sodium.Core.1.3.0\lib\\netstandard2.1\Sodium.Core.dll""
-          [System.Reflection.Assembly]::LoadFrom($sodiumPath)
+          Import-Module PSSodium
 
           $targetPat = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("":$($env:TARGET_PAT)""))
           $publicKeyResponse = Invoke-RestMethod -Uri ""https://api.github.com/repos/$env:TARGET_ORG/$env:TARGET_REPO/actions/secrets/public-key"" -Method ""GET"" -Headers @{{ Authorization = ""Basic $targetPat"" }}
           $publicKey = [Convert]::FromBase64String($publicKeyResponse.key)
           $publicKeyId = $publicKeyResponse.key_id
-              
-          $secrets = $env:REPO_SECRETS | ConvertFrom-Json
-          $secrets | Get-Member -MemberType NoteProperty | ForEach-Object {{
-            $secretName = $_.Name
-            $secretValue = $secrets.""$secretName""
-     
+          
+          # Encrypt secrets
+          $secrets = ${{env:REPO_SECRETS}} | ConvertFrom-Json
+          foreach ($secret in $secrets.PSObject.Properties) {{
+            $secretName = $secret.Name
+            $secretValue = $secret.Value
+
             if ($secretName -ne ""github_token"" -and $secretName -ne ""SECRETS_MIGRATOR_PAT"") {{
-              Write-Output ""Migrating Secret: $secretName""
-              $secretBytes = [Text.Encoding]::UTF8.GetBytes($secretValue)
-              $sealedPublicKeyBox = [Sodium.SealedPublicKeyBox]::Create($secretBytes, $publicKey)
-              $encryptedSecret = [Convert]::ToBase64String($sealedPublicKeyBox)
-                 
+              $encryptedSecret = ConvertTo-SodiumEncryptedString -Text $secretValue -PublicKey $publicKeyResponse.key
+
               $Params = @{{
-                Uri = ""https://api.github.com/repos/$env:TARGET_ORG/$env:TARGET_REPO/actions/secrets/$secretName""
+                Uri = ""https://api.github.com/repos/${{env:TARGET_ORG}}/${{env:TARGET_REPO}}/actions/secrets/$secretName""
                 Headers = @{{
                   Authorization = ""Basic $targetPat""
                 }}
@@ -133,10 +131,6 @@ jobs:
               $createSecretResponse = Invoke-RestMethod @Params
             }}
           }}
-
-          Write-Output ""Cleaning up...""
-          Invoke-RestMethod -Uri ""https://api.github.com/repos/${{{{ github.repository }}}}/git/${{{{ github.ref }}}}"" -Method ""DELETE"" -Headers @{{ Authorization = ""Basic $targetPat"" }}
-          Invoke-RestMethod -Uri ""https://api.github.com/repos/${{{{ github.repository }}}}/actions/secrets/SECRETS_MIGRATOR_PAT"" -Method ""DELETE"" -Headers @{{ Authorization = ""Basic $targetPat"" }}
         env:
           REPO_SECRETS: ${{{{ toJSON(secrets) }}}}
           TARGET_PAT: ${{{{ secrets.SECRETS_MIGRATOR_PAT }}}}
